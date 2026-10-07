@@ -54,6 +54,12 @@ export interface BuiltRuntime {
 	delegatedAgentConfigProvider?: DelegatedAgentConfigProvider;
 	extensions?: AgentConfig["extensions"];
 	completionPolicy?: AgentConfig["completionPolicy"];
+	/**
+	 * Settles once MCP servers that failed to connect during the build have
+	 * been retried and any recovered tools handed to the lead agent. Turns
+	 * await it so the first one sees those tools.
+	 */
+	mcpToolsReady?: Promise<void>;
 	registerLeadAgent?: (agent: LeadAgentHandle) => void;
 	shutdown: (reason: string) => Promise<void> | void;
 }

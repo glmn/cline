@@ -843,6 +843,77 @@ process.stdin.on("data", (chunk) => {
 		}
 	});
 
+	it("retries a stdio MCP server that missed its startup budget", async () => {
+		const tempRoot = mkdtempSync(join(tmpdir(), "runtime-builder-mcp-cold-"));
+		const serverPath = join(tempRoot, "cold-start-mcp-server.js");
+		const settingsPath = join(tempRoot, "cline_mcp_settings.json");
+		const markerPath = join(tempRoot, "warm");
+		const previousSettingsPath = process.env.CLINE_MCP_SETTINGS_PATH;
+
+		// Like a cold `npx`/`uvx` launch: the first process never answers
+		// initialize in time but warms the cache for the next launch.
+		writeFileSync(
+			serverPath,
+			`const fs = require("node:fs");
+const marker = ${JSON.stringify(markerPath)};
+const cold = !fs.existsSync(marker);
+fs.writeFileSync(marker, "");
+let buffer = "";
+function write(payload) {
+  process.stdout.write(JSON.stringify(payload) + "\\n");
+}
+process.stdin.on("data", (chunk) => {
+  if (cold) return;
+  buffer += chunk.toString("utf8");
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, newline).trim();
+    buffer = buffer.slice(newline + 1);
+    let message;
+    try { message = JSON.parse(line); } catch { continue; }
+    if (message.method === "initialize") {
+      write({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "linear", version: "1.0.0" } } });
+    } else if (message.method === "tools/list") {
+      write({ jsonrpc: "2.0", id: message.id, result: { tools: [{ name: "list_issues", inputSchema: { type: "object", properties: {} } }] } });
+    }
+  }
+});`,
+			"utf8",
+		);
+		writeFileSync(
+			settingsPath,
+			JSON.stringify({
+				mcpServers: {
+					linear: {
+						command: process.execPath,
+						args: [serverPath],
+						timeout: 1,
+					},
+				},
+			}),
+			"utf8",
+		);
+
+		process.env.CLINE_MCP_SETTINGS_PATH = settingsPath;
+		try {
+			const runtime = await new DefaultRuntimeBuilder().build({
+				config: makeBaseConfig(),
+			});
+			expect(runtime.tools.map((tool) => tool.name)).not.toContain(
+				"linear__list_issues",
+			);
+			const added: string[] = [];
+			runtime.registerLeadAgent?.({
+				addTools: (tools) => added.push(...tools.map((tool) => tool.name)),
+			});
+			await runtime.mcpToolsReady;
+			expect(added).toContain("linear__list_issues");
+			await runtime.shutdown("test");
+		} finally {
+			process.env.CLINE_MCP_SETTINGS_PATH = previousSettingsPath;
+		}
+	});
+
 	it("skips invalid MCP settings file without crashing", async () => {
 		const tempRoot = mkdtempSync(
 			join(tmpdir(), "runtime-builder-mcp-invalid-"),

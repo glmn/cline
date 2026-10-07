@@ -210,6 +210,7 @@ async function loadConfiguredMcpTools(options: {
 	agentPluginServers?: ReadonlyArray<AgentPluginPackageMcpServer>;
 }): Promise<{
 	tools: AgentTool[];
+	lateTools?: Promise<AgentTool[]>;
 	shutdown?: () => Promise<void>;
 }> {
 	const settingsPath = resolveDefaultMcpSettingsPath();
@@ -276,35 +277,56 @@ async function loadConfiguredMcpTools(options: {
 		return { tools: [] };
 	}
 
-	const enabled = registrations.filter((r) => r.disabled !== true);
-	const results = await Promise.allSettled(
-		enabled.map((r) =>
-			createMcpTools({
-				serverName: r.name,
-				provider: manager,
-				// Keep the tool wrapper timeout in agreement with the MCP
-				// request timeout: both derive from the server's registration.
-				timeoutMs: resolveMcpTimeoutSeconds(r.timeoutSeconds) * 1000,
-			}),
-		),
-	);
-	const tools: AgentTool[] = [];
-	for (const [i, result] of results.entries()) {
-		if (result.status === "fulfilled") {
-			tools.push(...result.value);
-		} else {
-			const message =
-				result.reason instanceof Error
-					? result.reason.message
-					: String(result.reason);
-			options.logger?.log(
-				`[mcp] Failed to load tools from MCP server "${enabled[i].name}", skipping: ${message}`,
-			);
+	const loadTools = async (
+		servers: typeof registrations,
+		onFailure: string,
+	) => {
+		const results = await Promise.allSettled(
+			servers.map((r) =>
+				createMcpTools({
+					serverName: r.name,
+					provider: manager,
+					// Keep the tool wrapper timeout in agreement with the MCP
+					// request timeout: both derive from the server's registration.
+					timeoutMs: resolveMcpTimeoutSeconds(r.timeoutSeconds) * 1000,
+				}),
+			),
+		);
+		const tools: AgentTool[] = [];
+		const failed: typeof registrations = [];
+		for (const [i, result] of results.entries()) {
+			if (result.status === "fulfilled") {
+				tools.push(...result.value);
+			} else {
+				failed.push(servers[i]);
+				const message =
+					result.reason instanceof Error
+						? result.reason.message
+						: String(result.reason);
+				options.logger?.log(
+					`[mcp] Failed to load tools from MCP server "${servers[i].name}", ${onFailure}: ${message}`,
+				);
+			}
 		}
-	}
+		return { tools, failed };
+	};
+
+	const initial = await loadTools(
+		registrations.filter((r) => r.disabled !== true),
+		"skipping",
+	);
+	// A stdio server that misses its initialize budget here (typically a cold
+	// `npx`/`uvx` launch resolving packages) usually answers on its next
+	// launch. Retry it once off the session-create critical path so it is not
+	// dropped for the whole session.
+	const retry = initial.failed.filter((r) => r.transport.type === "stdio");
 
 	return {
-		tools,
+		tools: initial.tools,
+		lateTools:
+			retry.length > 0
+				? loadTools(retry, "giving up after retry").then((r) => r.tools)
+				: undefined,
 		shutdown: async () => {
 			await manager.dispose();
 		},
@@ -463,6 +485,7 @@ export class DefaultRuntimeBuilder implements RuntimeBuilder {
 		const ownedUserInstructionServices: UserInstructionConfigService[] = [];
 		let userInstructionService = sharedUserInstructionService;
 		let mcpShutdown: (() => Promise<void>) | undefined;
+		let mcpLateTools: Promise<AgentTool[]> | undefined;
 
 		for (const error of configuredAgents.errors) {
 			(logger ?? config.logger)?.log?.(
@@ -594,6 +617,7 @@ export class DefaultRuntimeBuilder implements RuntimeBuilder {
 				});
 				tools.push(...mcpRuntime.tools);
 				mcpShutdown = mcpRuntime.shutdown;
+				mcpLateTools = mcpRuntime.lateTools;
 			}
 		}
 
@@ -862,6 +886,11 @@ export class DefaultRuntimeBuilder implements RuntimeBuilder {
 			: teamCompletionGuard
 				? { completionGuard: teamCompletionGuard }
 				: undefined;
+		let lateMcpTools: AgentTool[] = [];
+		const mcpToolsReady = mcpLateTools?.then((late) => {
+			lateMcpTools = filterAvailableTools(late, effectiveToolPolicies);
+			leadAgentInstance?.addTools(lateMcpTools);
+		});
 
 		return {
 			tools: finalTools,
@@ -875,6 +904,7 @@ export class DefaultRuntimeBuilder implements RuntimeBuilder {
 					?.delegatedAgentConfigProvider ?? delegatedAgentConfigProvider,
 			extensions: runtimeExtensions,
 			completionPolicy,
+			mcpToolsReady,
 			registerLeadAgent: (agent) => {
 				leadAgentInstance = agent;
 				if (pendingLeadTeamTools.length > 0) {
@@ -883,6 +913,9 @@ export class DefaultRuntimeBuilder implements RuntimeBuilder {
 							...globallyDisabledToolNames,
 						]),
 					);
+				}
+				if (lateMcpTools.length > 0) {
+					agent.addTools(lateMcpTools);
 				}
 			},
 			shutdown: async (reason: string) => {
